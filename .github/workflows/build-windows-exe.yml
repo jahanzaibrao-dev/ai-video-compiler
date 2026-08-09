@@ -1,0 +1,60 @@
+name: Build Windows EXE
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version/tag (e.g. v1.2.0)"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Enable long paths (ctranslate2/onnxruntime nest deeply)
+        run: git config --system core.longpaths true
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+          cache: "pip"
+          cache-dependency-path: requirements.txt
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Pre-fetch the Windows ffmpeg binary
+        # imageio_ffmpeg downloads its platform ffmpeg binary lazily on first use;
+        # PyInstaller's --collect-all needs it already present on disk to bundle it.
+        run: python -c "import imageio_ffmpeg; print(imageio_ffmpeg.get_ffmpeg_exe())"
+
+      - name: Build with PyInstaller
+        # --add-data uses ';' as the src/dest separator on Windows (':' on Mac/Linux,
+        # see PACKAGING.md) -- this is PyInstaller's own OS detection, not shell-specific.
+        run: >
+          pyinstaller --name "SceneVideoBuilder"
+          --onedir
+          --add-data "app.py;."
+          --collect-all faster_whisper
+          --collect-all imageio_ffmpeg
+          --collect-all gradio
+          --collect-all gradio_client
+          app.py
+
+      - name: Zip the build
+        run: Compress-Archive -Path "dist/SceneVideoBuilder/*" -DestinationPath "SceneVideoBuilder-windows-${{ inputs.version }}.zip"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.version }}
+          name: "SceneVideoBuilder ${{ inputs.version }} (Windows)"
+          files: SceneVideoBuilder-windows-${{ inputs.version }}.zip
