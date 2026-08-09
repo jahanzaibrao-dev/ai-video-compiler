@@ -47,6 +47,8 @@ jobs:
           --collect-all imageio_ffmpeg
           --collect-all gradio
           --collect-all gradio_client
+          --collect-all safehttpx
+          --collect-all groovy
           app.py
 
       - name: Zip the build

@@ -22,6 +22,8 @@ pyinstaller --name "SceneVideoBuilder" \
   --collect-all imageio_ffmpeg \
   --collect-all gradio \
   --collect-all gradio_client \
+  --collect-all safehttpx \
+  --collect-all groovy \
   app.py
 ```
 
@@ -33,6 +35,14 @@ Notes on the flags:
   the ffmpeg binary and whisper package data get copied into the bundle.
 - `--collect-all gradio` / `gradio_client` is needed because Gradio ships
   static frontend assets (JS/CSS) that PyInstaller doesn't pick up automatically.
+- `--collect-all safehttpx` / `groovy` — these are transitive Gradio
+  dependencies that each read a `version.txt` file next to their own
+  `__init__.py` at import time. `--collect-all gradio` doesn't reach into a
+  dependency's *own* data files, so without these two the app crashes
+  immediately on startup with `FileNotFoundError: ...version.txt` the moment
+  Gradio gets imported. If a future Gradio version pulls in a new dependency
+  with the same "read a sibling data file at import" pattern, this will
+  recur — the fix is always the same: `--collect-all <package>`.
 
 The build lands in `dist/SceneVideoBuilder/`. Zip that whole folder — that's
 the thing you hand to someone. They unzip it and double-click
