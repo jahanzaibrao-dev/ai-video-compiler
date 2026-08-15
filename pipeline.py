@@ -363,18 +363,20 @@ MIN_DURATION_FOR_TRANSITION = 5.0
 
 def _zoompan_filter(effect: str, duration: float, fps: int, out_w: int, out_h: int) -> str:
     frames = max(1, round(duration * fps))
-    # Peak zoom: 1.2 == the image ends up 20% larger than it started.
     zoom_max = 1.2
-    # Spread that 20% evenly over the scene so the move lasts the whole clip
-    # instead of hitting the cap early and freezing.
-    # Fixed notation: ffmpeg's expression parser doesn't read 1e-05 style floats.
-    zoom_rate = f"{(zoom_max - 1.0) / frames:.8f}"
 
-    if effect == "zoom_in":
-        z = f"min(zoom+{zoom_rate},{zoom_max})"
-        x, y = "iw/2-(iw/zoom/2)", "ih/2-(ih/zoom/2)"
-    elif effect == "zoom_out":
-        z = f"if(lte(on,{max(1, round(fps*0.2))}),{zoom_max}-({zoom_max}-1.0)*(on-1)/{max(1, round(fps*0.2))},max(zoom-{zoom_rate},1.0))"
+    if effect in ("zoom_in", "zoom_out"):
+        # Poori scene ke andar hi: pehle 1.0 se zoom_max tak zoom IN (pehla half),
+        # phir wahin se zoom_max se wapas 1.0 tak zoom OUT (doosra half).
+        # Koi jump nahi, koi freeze nahi -- pura ek continuous motion hai.
+        half = max(1, frames // 2)
+        up_den = max(1, half - 1)
+        down_den = max(1, frames - half)
+        z = (
+            f"if(lte(on,{half}),"
+            f"1.0+({zoom_max}-1.0)*(on-1)/{up_den},"
+            f"{zoom_max}-({zoom_max}-1.0)*(on-{half})/{down_den})"
+        )
         x, y = "iw/2-(iw/zoom/2)", "ih/2-(ih/zoom/2)"
     elif effect == "pan_left":
         z = "1.2"
@@ -393,8 +395,6 @@ def _zoompan_filter(effect: str, duration: float, fps: int, out_w: int, out_h: i
         f"scale=8000:-1,zoompan=z='{z}':d={frames}:x='{x}':y='{y}':"
         f"s={out_w}x{out_h}:fps={fps},format=yuv420p"
     )
-
-
 def render_scene_clip(
     image_path: str,
     duration: float,
