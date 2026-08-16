@@ -363,13 +363,18 @@ MIN_DURATION_FOR_TRANSITION = 5.0
 
 def _zoompan_filter(effect: str, duration: float, fps: int, out_w: int, out_h: int) -> str:
     frames = max(1, round(duration * fps))
-    zoom_rate = 0.0015
+    # Peak zoom: 1.2 == the image ends up 20% larger than it started.
+    zoom_max = 1.2
+    # Spread that 20% evenly over the scene so the move lasts the whole clip
+    # instead of hitting the cap early and freezing.
+    # Fixed notation: ffmpeg's expression parser doesn't read 1e-05 style floats.
+    zoom_rate = f"{(zoom_max - 1.0) / frames:.8f}"
 
     if effect == "zoom_in":
-        z = f"min(zoom+{zoom_rate},1.5)"
+        z = f"min(zoom+{zoom_rate},{zoom_max})"
         x, y = "iw/2-(iw/zoom/2)", "ih/2-(ih/zoom/2)"
     elif effect == "zoom_out":
-        z = f"if(eq(on,1),1.5,max(zoom-{zoom_rate},1.0))"
+        z = f"if(lte(on,{max(1, round(fps*0.2))}),{zoom_max}-({zoom_max}-1.0)*(on-1)/{max(1, round(fps*0.2))},max(zoom-{zoom_rate},1.0))"
         x, y = "iw/2-(iw/zoom/2)", "ih/2-(ih/zoom/2)"
     elif effect == "pan_left":
         z = "1.2"
