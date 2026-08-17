@@ -360,10 +360,14 @@ TRANSITION_LABELS = {
 # duration exceeds this many seconds; shorter scenes get a hard cut instead.
 MIN_DURATION_FOR_TRANSITION = 5.0
 
+# Scenes at or under this many seconds get a single Ken-Burns effect for their
+# full duration; longer scenes get two effects split across the two halves.
+SHORT_SCENE_EFFECT_THRESHOLD = 2.0
+
 
 def _zoompan_filter(effect: str, duration: float, fps: int, out_w: int, out_h: int) -> str:
     frames = max(1, round(duration * fps))
-    zoom_max = 1.2
+    zoom_max = 1.1
 
     if effect in ("zoom_in", "zoom_out"):
         # Poori scene ke andar hi: pehle 1.0 se zoom_max tak zoom IN (pehla half),
@@ -379,54 +383,81 @@ def _zoompan_filter(effect: str, duration: float, fps: int, out_w: int, out_h: i
         )
         x, y = "iw/2-(iw/zoom/2)", "ih/2-(ih/zoom/2)"
     elif effect == "pan_left":
-        z = "1.2"
+        z = str(zoom_max)
         x, y = f"(iw-iw/zoom)*(1-on/{frames})", "ih/2-(ih/zoom/2)"
     elif effect == "pan_right":
-        z = "1.2"
+        z = str(zoom_max)
         x, y = f"(iw-iw/zoom)*(on/{frames})", "ih/2-(ih/zoom/2)"
     elif effect == "pan_up":
-        z = "1.2"
+        z = str(zoom_max)
         x, y = "iw/2-(iw/zoom/2)", f"(ih-ih/zoom)*(1-on/{frames})"
     else:  # pan_down
-        z = "1.2"
+        z = str(zoom_max)
         x, y = "iw/2-(iw/zoom/2)", f"(ih-ih/zoom)*(on/{frames})"
 
     return (
         f"scale=8000:-1,zoompan=z='{z}':d={frames}:x='{x}':y='{y}':"
         f"s={out_w}x{out_h}:fps={fps},format=yuv420p"
     )
+
+
 def render_scene_clip(
     image_path: str,
     duration: float,
-    effect: Optional[str],
+    effects: list[str],
     out_path: str,
     resolution: tuple[int, int] = (1920, 1080),
     fps: int = 30,
 ) -> None:
     out_w, out_h = resolution
-    if effect:
-        vf = _zoompan_filter(effect, duration, fps, out_w, out_h)
-    else:
-        vf = (
-            f"scale={out_w}:{out_h}:force_original_aspect_ratio=increase,"
-            f"crop={out_w}:{out_h},format=yuv420p"
-        )
-    cmd = [
-        _ffmpeg(), "-y",
+    base_input = [
         # -framerate must match the output fps: without it, ffmpeg assumes a default
         # 25fps clock for the looped still image, so -t duration only ever supplies
         # duration*25 frames. At fps=30 that's close enough to pass unnoticed; at
         # fps=60 zoompan's d=frames (duration*60) needs more frames than the input
         # can supply within -t, so ffmpeg hits EOF early and the clip renders short
         # -- the shortfall compounds across scenes into audio/video drift.
-        "-loop", "1", "-framerate", str(fps), "-i", image_path,
-        "-t", f"{duration:.3f}",
-        "-vf", vf,
+        "-loop", "1", "-framerate", str(fps),
+    ]
+    tail = [
         "-r", str(fps),
         "-fps_mode", "cfr",
         "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p",
         out_path,
     ]
+
+    if len(effects) >= 2:
+        # Longer scenes split their on-screen time between two effects back to
+        # back (e.g. zoom_in then pan_left) instead of one motion for the whole
+        # duration. Rendered as two looped-image inputs, each trimmed to its own
+        # half and zoompan'd separately, then concatenated in one ffmpeg call.
+        d1 = duration / 2
+        d2 = duration - d1
+        vf1 = _zoompan_filter(effects[0], d1, fps, out_w, out_h)
+        vf2 = _zoompan_filter(effects[1], d2, fps, out_w, out_h)
+        cmd = [
+            _ffmpeg(), "-y",
+            *base_input, "-t", f"{d1:.3f}", "-i", image_path,
+            *base_input, "-t", f"{d2:.3f}", "-i", image_path,
+            "-filter_complex",
+            f"[0:v]{vf1}[v0];[1:v]{vf2}[v1];[v0][v1]concat=n=2:v=1:a=0[outv]",
+            "-map", "[outv]",
+            *tail,
+        ]
+    else:
+        if effects:
+            vf = _zoompan_filter(effects[0], duration, fps, out_w, out_h)
+        else:
+            vf = (
+                f"scale={out_w}:{out_h}:force_original_aspect_ratio=increase,"
+                f"crop={out_w}:{out_h},format=yuv420p"
+            )
+        cmd = [
+            _ffmpeg(), "-y",
+            *base_input, "-t", f"{duration:.3f}", "-i", image_path,
+            "-vf", vf,
+            *tail,
+        ]
     run(cmd)
 
 
@@ -675,19 +706,29 @@ def build_video(
 
     rng = random.Random(seed)
     effect_pool = EFFECTS[:] if effects is None else effects[:]
-    effect_order = effect_pool[:]
-    rng.shuffle(effect_order)
+
+    def next_effects(duration: float) -> list[str]:
+        # Only ever draws from the user's selected pool. Scenes longer than
+        # SHORT_SCENE_EFFECT_THRESHOLD get two distinct effects (one per half);
+        # shorter scenes get one. Never more than 2 regardless of pool size.
+        # Each scene draws independently at random, so a pool bigger than 2
+        # effects doesn't just cycle in a fixed order.
+        if not effect_pool:
+            return []
+        if duration > SHORT_SCENE_EFFECT_THRESHOLD and len(effect_pool) >= 2:
+            return rng.sample(effect_pool, 2)
+        return [rng.choice(effect_pool)]
 
     with tempfile.TemporaryDirectory(prefix="scenevid_") as workdir:
         clip_specs: list[tuple[str, float]] = []
         for i, (scene_text, (start, end)) in enumerate(zip(scenes, boundaries), start=1):
             duration = max(0.05, end - start)
-            effect = effect_order[(i - 1) % len(effect_order)] if effect_order else None
+            scene_effects = next_effects(duration)
             raw_clip = os.path.join(workdir, f"scene_{i:04d}_raw.mp4")
             frac = 0.55 + (i / len(scenes)) * 0.35  # per-scene rendering: 55% -> 90%
-            log(f"Scene {i}/{len(scenes)}: {duration:.2f}s, effect={effect or 'none'}", frac)
+            log(f"Scene {i}/{len(scenes)}: {duration:.2f}s, effect={'+'.join(scene_effects) or 'none'}", frac)
             render_scene_clip(
-                scene_images[i], duration, effect, raw_clip,
+                scene_images[i], duration, scene_effects, raw_clip,
                 resolution=resolution, fps=fps,
             )
 
