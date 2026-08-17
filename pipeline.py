@@ -22,6 +22,7 @@ See README.md for setup instructions and app.py for the dashboard UI.
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import difflib
 import json
 import os
@@ -360,43 +361,32 @@ TRANSITION_LABELS = {
 # duration exceeds this many seconds; shorter scenes get a hard cut instead.
 MIN_DURATION_FOR_TRANSITION = 5.0
 
-# Scenes at or under this many seconds get a single Ken-Burns effect for their
-# full duration; longer scenes get two effects split across the two halves.
-SHORT_SCENE_EFFECT_THRESHOLD = 2.0
-
 
 def _zoompan_filter(effect: str, duration: float, fps: int, out_w: int, out_h: int) -> str:
     frames = max(1, round(duration * fps))
-    zoom_max = 1.1
+    zoom_rate = 0.0015
 
-    if effect in ("zoom_in", "zoom_out"):
-        # Poori scene ke andar hi: pehle 1.0 se zoom_max tak zoom IN (pehla half),
-        # phir wahin se zoom_max se wapas 1.0 tak zoom OUT (doosra half).
-        # Koi jump nahi, koi freeze nahi -- pura ek continuous motion hai.
-        half = max(1, frames // 2)
-        up_den = max(1, half - 1)
-        down_den = max(1, frames - half)
-        z = (
-            f"if(lte(on,{half}),"
-            f"1.0+({zoom_max}-1.0)*(on-1)/{up_den},"
-            f"{zoom_max}-({zoom_max}-1.0)*(on-{half})/{down_den})"
-        )
+    if effect == "zoom_in":
+        z = f"min(zoom+{zoom_rate},1.5)"
+        x, y = "iw/2-(iw/zoom/2)", "ih/2-(ih/zoom/2)"
+    elif effect == "zoom_out":
+        z = f"if(eq(on,1),1.5,max(zoom-{zoom_rate},1.0))"
         x, y = "iw/2-(iw/zoom/2)", "ih/2-(ih/zoom/2)"
     elif effect == "pan_left":
-        z = str(zoom_max)
+        z = "1.2"
         x, y = f"(iw-iw/zoom)*(1-on/{frames})", "ih/2-(ih/zoom/2)"
     elif effect == "pan_right":
-        z = str(zoom_max)
+        z = "1.2"
         x, y = f"(iw-iw/zoom)*(on/{frames})", "ih/2-(ih/zoom/2)"
     elif effect == "pan_up":
-        z = str(zoom_max)
+        z = "1.2"
         x, y = "iw/2-(iw/zoom/2)", f"(ih-ih/zoom)*(1-on/{frames})"
     else:  # pan_down
-        z = str(zoom_max)
+        z = "1.2"
         x, y = "iw/2-(iw/zoom/2)", f"(ih-ih/zoom)*(on/{frames})"
 
     return (
-        f"scale=8000:-1,zoompan=z='{z}':d={frames}:x='{x}':y='{y}':"
+        f"scale=2560:-1,zoompan=z='{z}':d={frames}:x='{x}':y='{y}':"
         f"s={out_w}x{out_h}:fps={fps},format=yuv420p"
     )
 
@@ -404,60 +394,41 @@ def _zoompan_filter(effect: str, duration: float, fps: int, out_w: int, out_h: i
 def render_scene_clip(
     image_path: str,
     duration: float,
-    effects: list[str],
+    effect: Optional[str],
     out_path: str,
     resolution: tuple[int, int] = (1920, 1080),
     fps: int = 30,
+    ass_path: Optional[str] = None,
 ) -> None:
     out_w, out_h = resolution
-    base_input = [
+    if effect:
+        vf = _zoompan_filter(effect, duration, fps, out_w, out_h)
+    else:
+        vf = (
+            f"scale={out_w}:{out_h}:force_original_aspect_ratio=increase,"
+            f"crop={out_w}:{out_h},format=yuv420p"
+        )
+    if ass_path:
+        # Burn captions in the same filter chain/encode pass instead of a second
+        # ffmpeg call over the already-encoded clip -- halves the encode work per scene.
+        ass_escaped = ass_path.replace("\\", "/").replace(":", "\\:")
+        vf = f"{vf},subtitles='{ass_escaped}'"
+    cmd = [
+        _ffmpeg(), "-y",
         # -framerate must match the output fps: without it, ffmpeg assumes a default
         # 25fps clock for the looped still image, so -t duration only ever supplies
         # duration*25 frames. At fps=30 that's close enough to pass unnoticed; at
         # fps=60 zoompan's d=frames (duration*60) needs more frames than the input
         # can supply within -t, so ffmpeg hits EOF early and the clip renders short
         # -- the shortfall compounds across scenes into audio/video drift.
-        "-loop", "1", "-framerate", str(fps),
-    ]
-    tail = [
+        "-loop", "1", "-framerate", str(fps), "-i", image_path,
+        "-t", f"{duration:.3f}",
+        "-vf", vf,
         "-r", str(fps),
         "-fps_mode", "cfr",
         "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p",
         out_path,
     ]
-
-    if len(effects) >= 2:
-        # Longer scenes split their on-screen time between two effects back to
-        # back (e.g. zoom_in then pan_left) instead of one motion for the whole
-        # duration. Rendered as two looped-image inputs, each trimmed to its own
-        # half and zoompan'd separately, then concatenated in one ffmpeg call.
-        d1 = duration / 2
-        d2 = duration - d1
-        vf1 = _zoompan_filter(effects[0], d1, fps, out_w, out_h)
-        vf2 = _zoompan_filter(effects[1], d2, fps, out_w, out_h)
-        cmd = [
-            _ffmpeg(), "-y",
-            *base_input, "-t", f"{d1:.3f}", "-i", image_path,
-            *base_input, "-t", f"{d2:.3f}", "-i", image_path,
-            "-filter_complex",
-            f"[0:v]{vf1}[v0];[1:v]{vf2}[v1];[v0][v1]concat=n=2:v=1:a=0[outv]",
-            "-map", "[outv]",
-            *tail,
-        ]
-    else:
-        if effects:
-            vf = _zoompan_filter(effects[0], duration, fps, out_w, out_h)
-        else:
-            vf = (
-                f"scale={out_w}:{out_h}:force_original_aspect_ratio=increase,"
-                f"crop={out_w}:{out_h},format=yuv420p"
-            )
-        cmd = [
-            _ffmpeg(), "-y",
-            *base_input, "-t", f"{duration:.3f}", "-i", image_path,
-            "-vf", vf,
-            *tail,
-        ]
     run(cmd)
 
 
@@ -648,6 +619,25 @@ def get_audio_duration(audio_path: str) -> float:
     return int(h) * 3600 + int(mi) * 60 + float(s)
 
 
+def _render_one_scene(args: tuple) -> tuple[int, str, float]:
+    """Worker for parallel scene rendering. Must stay a top-level function (not a
+    closure/method) so it can be pickled and sent to a separate process."""
+    (i, image_path, duration, effect, scene_words, captions,
+     resolution, fps, workdir) = args
+
+    ass_path = None
+    if captions:
+        ass_path = os.path.join(workdir, f"scene_{i:04d}.ass")
+        build_scene_ass(scene_words, 0.0, duration, ass_path, resolution=resolution)
+
+    scene_clip = os.path.join(workdir, f"scene_{i:04d}.mp4")
+    render_scene_clip(
+        image_path, duration, effect, scene_clip,
+        resolution=resolution, fps=fps, ass_path=ass_path,
+    )
+    return i, scene_clip, duration
+
+
 # ---------------------------------------------------------------------------
 # Orchestration
 # ---------------------------------------------------------------------------
@@ -706,41 +696,38 @@ def build_video(
 
     rng = random.Random(seed)
     effect_pool = EFFECTS[:] if effects is None else effects[:]
-
-    def next_effects(duration: float) -> list[str]:
-        # Only ever draws from the user's selected pool. Scenes longer than
-        # SHORT_SCENE_EFFECT_THRESHOLD get two distinct effects (one per half);
-        # shorter scenes get one. Never more than 2 regardless of pool size.
-        # Each scene draws independently at random, so a pool bigger than 2
-        # effects doesn't just cycle in a fixed order.
-        if not effect_pool:
-            return []
-        if duration > SHORT_SCENE_EFFECT_THRESHOLD and len(effect_pool) >= 2:
-            return rng.sample(effect_pool, 2)
-        return [rng.choice(effect_pool)]
+    effect_order = effect_pool[:]
+    rng.shuffle(effect_order)
 
     with tempfile.TemporaryDirectory(prefix="scenevid_") as workdir:
-        clip_specs: list[tuple[str, float]] = []
+        # Build the per-scene task list up front, then render all scenes in
+        # parallel worker processes -- each ffmpeg render is CPU-bound and
+        # independent of the others, so this scales with available cores
+        # instead of rendering one scene at a time.
+        tasks = []
         for i, (scene_text, (start, end)) in enumerate(zip(scenes, boundaries), start=1):
             duration = max(0.05, end - start)
-            scene_effects = next_effects(duration)
-            raw_clip = os.path.join(workdir, f"scene_{i:04d}_raw.mp4")
-            frac = 0.55 + (i / len(scenes)) * 0.35  # per-scene rendering: 55% -> 90%
-            log(f"Scene {i}/{len(scenes)}: {duration:.2f}s, effect={'+'.join(scene_effects) or 'none'}", frac)
-            render_scene_clip(
-                scene_images[i], duration, scene_effects, raw_clip,
-                resolution=resolution, fps=fps,
-            )
+            effect = effect_order[(i - 1) % len(effect_order)] if effect_order else None
+            scene_words = [w for w in words if start <= (w.start + w.end) / 2 < end] if captions else []
+            tasks.append((
+                i, scene_images[i], duration, effect, scene_words,
+                captions, resolution, fps, workdir,
+            ))
 
-            if captions:
-                scene_words = [w for w in words if start <= (w.start + w.end) / 2 < end]
-                ass_path = os.path.join(workdir, f"scene_{i:04d}.ass")
-                build_scene_ass(scene_words, start, end, ass_path, resolution=resolution)
-                captioned_clip = os.path.join(workdir, f"scene_{i:04d}.mp4")
-                burn_subtitles(raw_clip, ass_path, captioned_clip)
-                clip_specs.append((captioned_clip, duration))
-            else:
-                clip_specs.append((raw_clip, duration))
+        max_workers = min(len(tasks), os.cpu_count() or 1)
+        results: dict[int, tuple[str, float]] = {}
+        done_count = 0
+        with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers) as pool:
+            futures = {pool.submit(_render_one_scene, t): t[0] for t in tasks}
+            for future in concurrent.futures.as_completed(futures):
+                i, scene_clip, duration = future.result()
+                results[i] = (scene_clip, duration)
+                done_count += 1
+                frac = 0.55 + (done_count / len(tasks)) * 0.35  # per-scene rendering: 55% -> 90%
+                log(f"Scene {i}/{len(scenes)} rendered ({done_count}/{len(tasks)} done)", frac)
+
+        # Recombine in original scene order (parallel completion order is arbitrary).
+        clip_specs: list[tuple[str, float]] = [results[i] for i in range(1, len(scenes) + 1)]
 
         if transitions:
             log("Applying transitions between eligible scenes...", 0.90)
