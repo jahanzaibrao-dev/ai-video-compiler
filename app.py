@@ -12,16 +12,17 @@ download the finished video. Everything runs locally - no cloud calls.
 
 from __future__ import annotations
 
+import multiprocessing
 import os
 import re
 import shutil
+import multiprocessing
 import tempfile
 import traceback
 import zipfile
 from pathlib import Path
 
 import gradio as gr
-
 from pipeline import (
     build_video,
     EFFECTS,
@@ -40,6 +41,11 @@ TRANSITION_CHOICES = [ALL_OPTION] + [TRANSITION_LABELS[t] for t in TRANSITIONS]
 _LABEL_TO_EFFECT = {v: k for k, v in EFFECT_LABELS.items()}
 _LABEL_TO_TRANSITION = {v: k for k, v in TRANSITION_LABELS.items()}
 
+# Percentage choices offered in each effect's ratio/weight dropdown.
+EFFECT_WEIGHT_CHOICES = [f"{p}%" for p in range(0, 101, 10)]
+
+
+
 
 def _resolve_selection(selected_labels, label_to_key, full_keys) -> list[str]:
     """Empty selection -> field disabled ([]). 'All' present -> every key."""
@@ -48,6 +54,14 @@ def _resolve_selection(selected_labels, label_to_key, full_keys) -> list[str]:
     if ALL_OPTION in selected_labels:
         return full_keys[:]
     return [label_to_key[label] for label in selected_labels if label in label_to_key]
+def _update_effect_weight_visibility(selected_labels):
+    """Show a ratio dropdown only for effects currently selected in the Effects
+    field above -- an effect that isn't enabled has no ratio to set, so hiding
+    it keeps the row from listing controls that don't do anything."""
+    enabled = set(_resolve_selection(selected_labels, _LABEL_TO_EFFECT, EFFECTS))
+    return tuple(gr.update(visible=(e in enabled)) for e in EFFECTS)
+
+
 
 
 def _make_all_toggle_handler(real_labels: list[str]):
@@ -81,6 +95,17 @@ def _make_all_toggle_handler(real_labels: list[str]):
         return gr.update(value=result), result
 
     return handler
+
+def _parse_effect_weight(value: str) -> float:
+    """'70%' -> 70.0. Defensive against blank/None values from the UI."""
+    if not value:
+        return 0.0
+    try:
+        return float(str(value).strip().rstrip("%"))
+    except ValueError:
+        return 0.0
+
+
 
 
 def _prepare_images_dir(images_zip, images_folder_path: str) -> str:
@@ -132,15 +157,23 @@ def run_pipeline(
     captions,
     video_title,
     output_folder,
+    *effect_weight_values,
+
+
     progress=gr.Progress(track_tqdm=False),
 ):
     try:
         if script_file is None:
-            raise gr.Error("Please upload a script (.txt) file.")
+            raise gr.Error("Please upload a script (.txt or .csv) file.")
+
+
         if audio_file is None:
             raise gr.Error("Please upload the voiceover audio file.")
         if not output_folder or not output_folder.strip():
             raise gr.Error("Please choose an output folder.")
+        is_csv = Path(script_file.name).suffix.lower() == ".csv"
+
+
 
         images_dir = _prepare_images_dir(images_zip, images_folder_path)
 
@@ -168,8 +201,26 @@ def run_pipeline(
         effects = _resolve_selection(effects_selected, _LABEL_TO_EFFECT, EFFECTS)
         transitions = _resolve_selection(transitions_selected, _LABEL_TO_TRANSITION, TRANSITIONS)
 
+        # effect_weight_values arrives positionally in the same order as EFFECTS
+        # (see the dropdowns built in the UI section below). Only weights for
+        # effects that are actually enabled in `effects` matter; a 0% weight
+        # (or an effect left out of `effects` entirely) excludes it from the mix.
+        effect_weights = {
+            effect: _parse_effect_weight(value)
+            for effect, value in zip(EFFECTS, effect_weight_values)
+        }
+        effect_weights = {e: w for e, w in effect_weights.items() if e in effects and w > 0}
+        # No positive weights among the enabled effects -> fall back to the even
+        # round-robin cycling build_video already does when effect_weights=None.
+        if not effect_weights:
+            effect_weights = None
+
+
+        
         build_video(
-            script_path=script_file.name,
+                                    script_path=None if is_csv else script_file.name,
+            csv_path=script_file.name if is_csv else None,
+
             audio_path=audio_file.name,
             images_dir=images_dir,
             out_path=out_path,
@@ -178,6 +229,7 @@ def run_pipeline(
             model_size=model_size,
             captions=captions,
             effects=effects,
+            effect_weights=effect_weights,
             transitions=transitions,
             progress_cb=progress_cb,
         )
@@ -200,7 +252,10 @@ with gr.Blocks(title="Scene-Synced Slideshow Video Builder") as demo:
 
     with gr.Row():
         with gr.Column():
-            script_file = gr.File(label="Script (.txt)", file_types=[".txt"])
+            script_file = gr.File(
+                label="Script — .txt or CSV (columns: scene, text, image [optional])",
+                file_types=[".txt", ".csv"],
+            )
             audio_file = gr.File(label="Voiceover (.mp3/.wav/.m4a)")
             gr.Markdown("**Scene images** — provide ONE of the two options below:")
             images_folder_path = gr.Textbox(
@@ -240,6 +295,23 @@ with gr.Blocks(title="Scene-Synced Slideshow Video Builder") as demo:
                 info="Pan/zoom effects applied randomly per scene. Deselect all to show plain static images.",
             )
             effects_prev_state = gr.State([ALL_OPTION] + EFFECT_CHOICES[1:])
+            
+            gr.Markdown(
+                "**Effect  (ratio) **— only matters for effects that are enabled above.**\n"
+            )
+            effect_weight_dropdowns = {}
+            with gr.Row():
+                for e in EFFECTS:
+                    effect_weight_dropdowns[e] = gr.Dropdown(
+                        label=EFFECT_LABELS[e],
+                        choices=EFFECT_WEIGHT_CHOICES,
+                        value="10",
+                        allow_custom_value=True,
+                        visible=True,  # default Effects selection is "All", so all start visible
+
+                    )
+
+
             transitions_selected = gr.Dropdown(
                 label="Transitions",
                 choices=TRANSITION_CHOICES,
@@ -263,6 +335,13 @@ with gr.Blocks(title="Scene-Synced Slideshow Video Builder") as demo:
                 inputs=[effects_selected, effects_prev_state],
                 outputs=[effects_selected, effects_prev_state],
             )
+            effects_selected.change(
+                fn=_update_effect_weight_visibility,
+                inputs=[effects_selected],
+                outputs=[effect_weight_dropdowns[e] for e in EFFECTS],
+            )
+
+            
             transitions_selected.change(
                 fn=_make_all_toggle_handler(TRANSITION_CHOICES[1:]),
                 inputs=[transitions_selected, transitions_prev_state],
@@ -279,9 +358,20 @@ with gr.Blocks(title="Scene-Synced Slideshow Video Builder") as demo:
             width, height, fps, model_size,
             effects_selected, transitions_selected, captions,
             video_title, output_folder,
-        ],
+        ] + [effect_weight_dropdowns[e] for e in EFFECTS],
+
         outputs=[output_video, log_box],
     )
 
 if __name__ == "__main__":
+
+        # Required for a PyInstaller/frozen .exe on Windows that uses multiprocessing
+    # (build_video's ProcessPoolExecutor for parallel scene rendering). Without this,
+    # every spawned worker process re-executes the frozen app from scratch -- including
+    # this launch() call -- which is why the console shows new Gradio servers popping up
+    # on new ports (7861, 7862, ...) partway through a render even though you only
+    # started the app once. Must be the very first thing done under this guard.
+    multiprocessing.freeze_support()
+
+    
     demo.queue().launch(inbrowser=True)
