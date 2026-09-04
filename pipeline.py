@@ -22,8 +22,11 @@ See README.md for setup instructions and app.py for the dashboard UI.
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
+import csv
 import difflib
 import json
+import multiprocessing
 import os
 import random
 import re
@@ -144,31 +147,155 @@ def parse_script_into_scenes(script_text: str) -> list[str]:
     return split_sentences(script_text)
 
 
+def parse_csv_into_scenes(csv_path: str) -> tuple[list[str], dict[int, str]]:
+    """Alternative to parse_script_into_scenes(): reads scenes from a CSV file
+    instead of a .txt script.
+
+    Expected columns (header required, case-insensitive, a few aliases accepted):
+      - scene number : "scene" / "scene_number" / "scene#" / "#" / "no"
+      - text         : "text" / "script" / "narration" / "line" / "content"
+      - image (opt.) : "image" / "image_path" / "img" / "file"
+        If present, this overrides the numbered-filename lookup that
+        find_scene_images() would otherwise do for that scene.
+
+    Scene numbers must form a contiguous 1..N sequence (gaps raise an error,
+    same rule as the marker-based script format). Rows are re-ordered by
+    scene number, so the CSV rows themselves don't need to be sorted.
+
+    Returns (scene_texts, image_overrides) where image_overrides maps
+    scene_number -> path (only for scenes that had an image column filled in).
+    """
+    path = Path(csv_path)
+    if not path.exists():
+        raise FileNotFoundError(f"CSV file not found: {csv_path}")
+
+    with path.open(newline="", encoding="utf-8-sig") as f:
+        reader = csv.DictReader(f)
+        if not reader.fieldnames:
+            raise ValueError(f"CSV file has no header row: {csv_path}")
+
+        norm_fields = {name.strip().lower(): name for name in reader.fieldnames}
+
+        def pick(*candidates: str) -> Optional[str]:
+            for c in candidates:
+                if c in norm_fields:
+                    return norm_fields[c]
+            return None
+
+        scene_col = pick("scene", "scene_number", "scene#", "#", "no")
+        text_col = pick("text", "script", "narration", "line", "content")
+        image_col = pick("image", "image_path", "img", "file")
+
+        if scene_col is None or text_col is None:
+            raise ValueError(
+                "CSV must have a scene-number column (e.g. 'scene') and a "
+                f"text column (e.g. 'text'). Found columns: {reader.fieldnames}"
+            )
+
+        rows: dict[int, str] = {}
+        image_overrides: dict[int, str] = {}
+        for row_num, row in enumerate(reader, start=2):  # header is line 1
+            raw_scene = (row.get(scene_col) or "").strip()
+            if not raw_scene:
+                continue
+            try:
+                scene_num = int(raw_scene)
+            except ValueError:
+                raise ValueError(
+                    f"CSV row {row_num}: scene number '{raw_scene}' is not an integer."
+                )
+            if scene_num in rows:
+                raise ValueError(f"CSV row {row_num}: duplicate scene number {scene_num}.")
+            rows[scene_num] = (row.get(text_col) or "").strip()
+            if image_col:
+                img = (row.get(image_col) or "").strip()
+                if img:
+                    image_overrides[scene_num] = img
+
+    if not rows:
+        raise ValueError(f"No scene rows found in CSV: {csv_path}")
+
+    max_scene = max(rows.keys())
+    missing = [i for i in range(1, max_scene + 1) if i not in rows]
+    if missing:
+        raise ValueError(f"CSV is missing scene number(s): {missing}")
+
+    scenes = [rows[i] for i in range(1, max_scene + 1)]
+    return scenes, image_overrides
+
+
 # ---------------------------------------------------------------------------
-# 2. Locate scene-numbered images
+# 2. Locate scene-numbered images (or video clips)
 # ---------------------------------------------------------------------------
 
 IMAGE_EXTS = [".png", ".jpg", ".jpeg", ".webp", ".bmp"]
+VIDEO_EXTS = [".mp4", ".mov", ".mkv", ".webm", ".avi", ".m4v"]
+MEDIA_EXTS = IMAGE_EXTS + VIDEO_EXTS
 
 
-def find_scene_images(images_dir: str, num_scenes: int) -> dict[int, str]:
+def is_video_file(path: str) -> bool:
+    return Path(path).suffix.lower() in VIDEO_EXTS
+
+
+def _scene_number_stem(path: Path) -> str:
+    """Strip repeated/duplicate media extensions from a filename before
+    reading the scene number (e.g. a Windows rename mistake producing
+    "1.mp4.mp4" would otherwise read digit "4" from the accidental extra
+    ".mp4" instead of the real scene number "1")."""
+    stem = path.stem
+    while True:
+        inner = Path(stem)
+        if inner.suffix.lower() in MEDIA_EXTS:
+            stem = inner.stem
+        else:
+            return stem
+
+
+def find_scene_images(
+    images_dir: str, num_scenes: int, overrides: Optional[dict[int, str]] = None
+) -> dict[int, str]:
+    """Returns scene_number -> path, where the path may be a still image OR a
+    video clip (e.g. "3.png" or "3.mp4") -- both are named the same way.
+
+    If BOTH an image and a video exist for the same scene number, the video
+    wins (a video was deliberately added, so it should override the still).
+
+    overrides: optional {scene_number: image_path_or_ref} from a CSV's image
+    column; these always take priority over the numbered-filename lookup.
+    """
     images_dir = Path(images_dir)
-    by_scene: dict[int, str] = {}
+    image_by_scene: dict[int, str] = {}
+    video_by_scene: dict[int, str] = {}
     for path in sorted(images_dir.iterdir()):
-        if not path.is_file() or path.suffix.lower() not in IMAGE_EXTS:
+        if not path.is_file() or path.suffix.lower() not in MEDIA_EXTS:
             continue
-        match = re.search(r"(\d+)$", path.stem)
+        match = re.search(r"(\d+)$", _scene_number_stem(path))
         if not match:
             continue
         scene_num = int(match.group(1))
-        by_scene.setdefault(scene_num, str(path))
+        target = video_by_scene if is_video_file(str(path)) else image_by_scene
+        target.setdefault(scene_num, str(path))
+
+    by_scene = {**image_by_scene, **video_by_scene}  # video overrides image on conflict
+
+    # CSV-supplied explicit image paths win over the numbered-filename lookup.
+    if overrides:
+        for scene_num, img_ref in overrides.items():
+            candidates = [Path(img_ref), images_dir / img_ref]
+            resolved = next((str(c) for c in candidates if c.is_file()), None)
+            if resolved is None:
+                raise FileNotFoundError(
+                    f"CSV image override for scene {scene_num} not found "
+                    f"(tried '{img_ref}' and '{images_dir / img_ref}')."
+                )
+            by_scene[scene_num] = resolved
 
     missing = [i for i in range(1, num_scenes + 1) if i not in by_scene]
     if missing:
         raise FileNotFoundError(
-            f"Not enough scene images in {images_dir}\n"
+            f"Not enough scene images/clips in {images_dir}\n"
             f"Scenes Found: {num_scenes}\n"
-            f"Images Found: {len(by_scene)}\n"
+            f"Images/Clips Found: {len(by_scene)}\n"
             f"Missing scene number(s): {missing}"
         )
     return {i: by_scene[i] for i in range(1, num_scenes + 1)}
@@ -360,16 +487,30 @@ TRANSITION_LABELS = {
 # duration exceeds this many seconds; shorter scenes get a hard cut instead.
 MIN_DURATION_FOR_TRANSITION = 5.0
 
+# Below this duration, a Ken-Burns pan/zoom effect barely gets going before the
+# scene cuts away -- it reads as a jerky blip rather than a deliberate motion.
+# Scenes shorter than this show the plain static image instead (same reasoning
+# as MIN_DURATION_FOR_TRANSITION, just for effects instead of transitions).
+MIN_DURATION_FOR_EFFECT = 4.0
+
 
 def _zoompan_filter(effect: str, duration: float, fps: int, out_w: int, out_h: int) -> str:
     frames = max(1, round(duration * fps))
-    zoom_rate = 0.0015
+    # Zoom travels from 1.0x to 1.5x (or back). Scaling the per-frame rate to
+    # this scene's frame count means it always lands on 1.5x/1.0x exactly on
+    # the LAST frame, no matter how long the scene is. A fixed rate (e.g.
+    # always 0.0015/frame) reaches the cap after a fixed ~11s regardless of
+    # scene length -- for any scene longer than that, the image visibly
+    # freezes (zoom stuck at the cap) for the remaining duration while the
+    # voiceover keeps playing.
+    zoom_range = 0.5  # 1.0 -> 1.5
+    zoom_rate = zoom_range / frames
 
     if effect == "zoom_in":
-        z = f"min(zoom+{zoom_rate},1.5)"
+        z = f"min(zoom+{zoom_rate:.8f},1.5)"
         x, y = "iw/2-(iw/zoom/2)", "ih/2-(ih/zoom/2)"
     elif effect == "zoom_out":
-        z = f"if(eq(on,1),1.5,max(zoom-{zoom_rate},1.0))"
+        z = f"if(eq(on,1),1.5,max(zoom-{zoom_rate:.8f},1.0))"
         x, y = "iw/2-(iw/zoom/2)", "ih/2-(ih/zoom/2)"
     elif effect == "pan_left":
         z = "1.2"
@@ -385,7 +526,7 @@ def _zoompan_filter(effect: str, duration: float, fps: int, out_w: int, out_h: i
         x, y = "iw/2-(iw/zoom/2)", f"(ih-ih/zoom)*(on/{frames})"
 
     return (
-        f"scale=8000:-1,zoompan=z='{z}':d={frames}:x='{x}':y='{y}':"
+        f"scale=2560:-1,zoompan=z='{z}':d={frames}:x='{x}':y='{y}':"
         f"s={out_w}x{out_h}:fps={fps},format=yuv420p"
     )
 
@@ -397,7 +538,12 @@ def render_scene_clip(
     out_path: str,
     resolution: tuple[int, int] = (1920, 1080),
     fps: int = 30,
+    ass_path: Optional[str] = None,
 ) -> None:
+    if is_video_file(image_path):
+        _render_video_scene_clip(image_path, duration, out_path, resolution, fps, ass_path=ass_path)
+        return
+
     out_w, out_h = resolution
     if effect:
         vf = _zoompan_filter(effect, duration, fps, out_w, out_h)
@@ -406,6 +552,11 @@ def render_scene_clip(
             f"scale={out_w}:{out_h}:force_original_aspect_ratio=increase,"
             f"crop={out_w}:{out_h},format=yuv420p"
         )
+    if ass_path:
+        # Burn captions in the same filter chain/encode pass instead of a second
+        # ffmpeg call over the already-encoded clip -- halves the encode work per scene.
+        ass_escaped = ass_path.replace("\\", "/").replace(":", "\\:")
+        vf = f"{vf},subtitles='{ass_escaped}'"
     cmd = [
         _ffmpeg(), "-y",
         # -framerate must match the output fps: without it, ffmpeg assumes a default
@@ -419,6 +570,46 @@ def render_scene_clip(
         "-vf", vf,
         "-r", str(fps),
         "-fps_mode", "cfr",
+        "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p",
+        out_path,
+    ]
+    run(cmd)
+
+
+def _render_video_scene_clip(
+    video_path: str,
+    duration: float,
+    out_path: str,
+    resolution: tuple[int, int],
+    fps: int,
+    ass_path: Optional[str] = None,
+) -> None:
+    """Scene source is itself a video clip (e.g. b-roll) rather than a still
+    image. Scaled/cropped to fill the frame the same way images are, then
+    looped (not frozen on the last frame) if shorter than the scene needs and
+    trimmed to the EXACT scene duration -- same guarantee as image scenes.
+    No Ken-Burns zoompan effect here since the clip already has real motion.
+    Captions (ass_path) are burned in the same filter chain, same as images.
+    The clip's own audio is dropped (-an): the final render always mixes in
+    the single continuous voiceover track on top, so any embedded audio here
+    would just be muted/discarded anyway."""
+    out_w, out_h = resolution
+    vf = (
+        f"scale={out_w}:{out_h}:force_original_aspect_ratio=increase,"
+        f"crop={out_w}:{out_h},format=yuv420p,fps={fps}"
+    )
+    if ass_path:
+        ass_escaped = ass_path.replace("\\", "/").replace(":", "\\:")
+        vf = f"{vf},subtitles='{ass_escaped}'"
+    cmd = [
+        _ffmpeg(), "-y",
+        "-stream_loop", "-1",  # loop source indefinitely; -t below cuts to exact length
+        "-i", video_path,
+        "-t", f"{duration:.3f}",
+        "-vf", vf,
+        "-r", str(fps),
+        "-fps_mode", "cfr",
+        "-an",
         "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p",
         out_path,
     ]
@@ -612,27 +803,62 @@ def get_audio_duration(audio_path: str) -> float:
     return int(h) * 3600 + int(mi) * 60 + float(s)
 
 
+def _render_one_scene(args: tuple) -> tuple[int, str, float]:
+    """Worker for parallel scene rendering. Must stay a top-level function (not a
+    closure/method) so it can be pickled and sent to a separate process."""
+    (i, image_path, duration, effect, scene_words, captions,
+     resolution, fps, workdir) = args
+
+    ass_path = None
+    if captions:
+        ass_path = os.path.join(workdir, f"scene_{i:04d}.ass")
+        build_scene_ass(scene_words, 0.0, duration, ass_path, resolution=resolution)
+
+    scene_clip = os.path.join(workdir, f"scene_{i:04d}.mp4")
+    render_scene_clip(
+        image_path, duration, effect, scene_clip,
+        resolution=resolution, fps=fps, ass_path=ass_path,
+    )
+    return i, scene_clip, duration
+
+
 # ---------------------------------------------------------------------------
 # Orchestration
 # ---------------------------------------------------------------------------
 
 def build_video(
-    script_path: str,
     audio_path: str,
     images_dir: str,
     out_path: str,
+    script_path: Optional[str] = None,
+    csv_path: Optional[str] = None,
     resolution: tuple[int, int] = (1920, 1080),
     fps: int = 30,
     model_size: str = "small",
     captions: bool = True,
     effects: Optional[list[str]] = None,
+    effect_weights: Optional[dict[str, float]] = None,
     transitions: Optional[list[str]] = None,
     seed: int = 42,
     progress_cb: Optional[Callable[[str, Optional[float]], None]] = None,
 ) -> str:
     """
+    script_path / csv_path: exactly one must be given. script_path is a .txt
+        file parsed by parse_script_into_scenes(); csv_path is a CSV file
+        parsed by parse_csv_into_scenes() (columns: scene, text, and
+        optionally image -- see that function's docstring). Both produce the
+        same ordered list of scene texts feeding the rest of the pipeline.
     effects: pool of Ken-Burns effect names to apply randomly per scene.
         None -> use all of EFFECTS (default/back-compat). [] -> no effect at all.
+        Video-clip scenes never get an effect regardless of this pool, since
+        the clip already has real motion.
+    effect_weights: optional {effect_name: weight} mix controlling how often each
+        effect in `effects` is picked (e.g. {"zoom_in": 70, "pan_left": 30} makes
+        zoom_in ~2.3x more likely than pan_left). Weights are relative, not
+        required to sum to 100. Effects not present in `effects` are ignored even
+        if a weight is given for them. None -> effects are cycled evenly
+        (original round-robin shuffle behavior). An effect present in `effects`
+        but missing from effect_weights (or given weight 0) never gets picked.
     transitions: pool of xfade transition names to apply randomly between eligible
         scenes. None or [] -> no transitions (hard cuts only).
 
@@ -645,11 +871,19 @@ def build_video(
             progress_cb(msg, frac)
         print(msg)
 
-    script_text = Path(script_path).read_text(encoding="utf-8")
-    scenes = parse_script_into_scenes(script_text)
-    log(f"Parsed {len(scenes)} scene(s) from script.", 0.01)
+    if bool(script_path) == bool(csv_path):
+        raise ValueError("Provide exactly one of script_path or csv_path (not both, not neither).")
 
-    scene_images = find_scene_images(images_dir, len(scenes))
+    image_overrides: dict[int, str] = {}
+    if csv_path:
+        scenes, image_overrides = parse_csv_into_scenes(csv_path)
+        log(f"Parsed {len(scenes)} scene(s) from CSV.", 0.01)
+    else:
+        script_text = Path(script_path).read_text(encoding="utf-8")
+        scenes = parse_script_into_scenes(script_text)
+        log(f"Parsed {len(scenes)} scene(s) from script.", 0.01)
+
+    scene_images = find_scene_images(images_dir, len(scenes), overrides=image_overrides)
     log("All scene images found.", 0.02)
 
     total_duration = get_audio_duration(audio_path)
@@ -670,31 +904,63 @@ def build_video(
 
     rng = random.Random(seed)
     effect_pool = EFFECTS[:] if effects is None else effects[:]
-    effect_order = effect_pool[:]
-    rng.shuffle(effect_order)
+
+    if effect_weights:
+        # Weighted mode: only effects that are both in the pool AND carry a
+        # positive weight are eligible; each scene independently draws from
+        # that weighted distribution.
+        weighted_effects = [e for e in effect_pool if effect_weights.get(e, 0) > 0]
+        weights = [effect_weights[e] for e in weighted_effects]
+        if weighted_effects:
+            def next_effect() -> Optional[str]:
+                return rng.choices(weighted_effects, weights=weights, k=1)[0]
+        else:
+            def next_effect() -> Optional[str]:
+                return None
+    else:
+        # Back-compat mode: cycle evenly through a shuffled pool.
+        effect_order = effect_pool[:]
+        rng.shuffle(effect_order)
 
     with tempfile.TemporaryDirectory(prefix="scenevid_") as workdir:
-        clip_specs: list[tuple[str, float]] = []
+        # Build the per-scene task list up front, then render all scenes in
+        # parallel worker processes -- each ffmpeg render is CPU-bound and
+        # independent of the others, so this scales with available cores
+        # instead of rendering one scene at a time.
+        tasks = []
         for i, (scene_text, (start, end)) in enumerate(zip(scenes, boundaries), start=1):
             duration = max(0.05, end - start)
-            effect = effect_order[(i - 1) % len(effect_order)] if effect_order else None
-            raw_clip = os.path.join(workdir, f"scene_{i:04d}_raw.mp4")
-            frac = 0.55 + (i / len(scenes)) * 0.35  # per-scene rendering: 55% -> 90%
-            log(f"Scene {i}/{len(scenes)}: {duration:.2f}s, effect={effect or 'none'}", frac)
-            render_scene_clip(
-                scene_images[i], duration, effect, raw_clip,
-                resolution=resolution, fps=fps,
-            )
-
-            if captions:
-                scene_words = [w for w in words if start <= (w.start + w.end) / 2 < end]
-                ass_path = os.path.join(workdir, f"scene_{i:04d}.ass")
-                build_scene_ass(scene_words, start, end, ass_path, resolution=resolution)
-                captioned_clip = os.path.join(workdir, f"scene_{i:04d}.mp4")
-                burn_subtitles(raw_clip, ass_path, captioned_clip)
-                clip_specs.append((captioned_clip, duration))
+            scene_is_video = is_video_file(scene_images[i])
+            if scene_is_video:
+                effect = None
+            elif effect_weights:
+                effect = next_effect()
             else:
-                clip_specs.append((raw_clip, duration))
+                effect = effect_order[(i - 1) % len(effect_order)] if effect_order else None
+            if duration < MIN_DURATION_FOR_EFFECT:
+                effect = None  # too short for a pan/zoom to read as intentional
+            effect_label = "none (video clip)" if scene_is_video else (effect or "none")
+            log(f"Scene {i}/{len(scenes)}: {duration:.2f}s, effect={effect_label}")
+            scene_words = [w for w in words if start <= (w.start + w.end) / 2 < end] if captions else []
+            tasks.append((
+                i, scene_images[i], duration, effect, scene_words,
+                captions, resolution, fps, workdir,
+            ))
+
+        max_workers = min(len(tasks), os.cpu_count() or 1)
+        results: dict[int, tuple[str, float]] = {}
+        done_count = 0
+        with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers) as pool:
+            futures = {pool.submit(_render_one_scene, t): t[0] for t in tasks}
+            for future in concurrent.futures.as_completed(futures):
+                i, scene_clip, duration = future.result()
+                results[i] = (scene_clip, duration)
+                done_count += 1
+                frac = 0.55 + (done_count / len(tasks)) * 0.35  # per-scene rendering: 55% -> 90%
+                log(f"Scene {i}/{len(scenes)} rendered ({done_count}/{len(tasks)} done)", frac)
+
+        # Recombine in original scene order (parallel completion order is arbitrary).
+        clip_specs: list[tuple[str, float]] = [results[i] for i in range(1, len(scenes) + 1)]
 
         if transitions:
             log("Applying transitions between eligible scenes...", 0.90)
@@ -713,7 +979,12 @@ def build_video(
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--script", required=True, help="Path to script .txt file")
+    source_group = ap.add_mutually_exclusive_group(required=True)
+    source_group.add_argument("--script", help="Path to script .txt file")
+    source_group.add_argument(
+        "--csv",
+        help="Path to CSV file with scene,text[,image] columns (alternative to --script)",
+    )
     ap.add_argument("--audio", required=True, help="Path to voiceover audio file")
     ap.add_argument("--images-dir", required=True, help="Folder containing 1.png, 2.jpg, ... per scene")
     ap.add_argument("--out", required=True, help="Output .mp4 path")
@@ -726,6 +997,7 @@ def main() -> None:
 
     build_video(
         script_path=args.script,
+        csv_path=args.csv,
         audio_path=args.audio,
         images_dir=args.images_dir,
         out_path=args.out,
@@ -737,4 +1009,10 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    # Same reason as app.py: build_video() uses ProcessPoolExecutor, and if this
+    # script is ever run from a frozen/PyInstaller .exe (instead of only being
+    # imported by app.py), every spawned worker process needs this call first to
+    # avoid re-executing the whole CLI from scratch. Harmless as a no-op on a
+    # normal `python pipeline.py ...` run.
+    multiprocessing.freeze_support()
     main()
