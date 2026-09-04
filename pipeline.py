@@ -225,25 +225,58 @@ def parse_csv_into_scenes(csv_path: str) -> tuple[list[str], dict[int, str]]:
 
 
 # ---------------------------------------------------------------------------
-# 2. Locate scene-numbered images
+# 2. Locate scene-numbered images (or video clips)
 # ---------------------------------------------------------------------------
 
 IMAGE_EXTS = [".png", ".jpg", ".jpeg", ".webp", ".bmp"]
+VIDEO_EXTS = [".mp4", ".mov", ".mkv", ".webm", ".avi", ".m4v"]
+MEDIA_EXTS = IMAGE_EXTS + VIDEO_EXTS
+
+
+def is_video_file(path: str) -> bool:
+    return Path(path).suffix.lower() in VIDEO_EXTS
+
+
+def _scene_number_stem(path: Path) -> str:
+    """Strip repeated/duplicate media extensions from a filename before
+    reading the scene number (e.g. a Windows rename mistake producing
+    "1.mp4.mp4" would otherwise read digit "4" from the accidental extra
+    ".mp4" instead of the real scene number "1")."""
+    stem = path.stem
+    while True:
+        inner = Path(stem)
+        if inner.suffix.lower() in MEDIA_EXTS:
+            stem = inner.stem
+        else:
+            return stem
 
 
 def find_scene_images(
     images_dir: str, num_scenes: int, overrides: Optional[dict[int, str]] = None
 ) -> dict[int, str]:
+    """Returns scene_number -> path, where the path may be a still image OR a
+    video clip (e.g. "3.png" or "3.mp4") -- both are named the same way.
+
+    If BOTH an image and a video exist for the same scene number, the video
+    wins (a video was deliberately added, so it should override the still).
+
+    overrides: optional {scene_number: image_path_or_ref} from a CSV's image
+    column; these always take priority over the numbered-filename lookup.
+    """
     images_dir = Path(images_dir)
-    by_scene: dict[int, str] = {}
+    image_by_scene: dict[int, str] = {}
+    video_by_scene: dict[int, str] = {}
     for path in sorted(images_dir.iterdir()):
-        if not path.is_file() or path.suffix.lower() not in IMAGE_EXTS:
+        if not path.is_file() or path.suffix.lower() not in MEDIA_EXTS:
             continue
-        match = re.search(r"(\d+)$", path.stem)
+        match = re.search(r"(\d+)$", _scene_number_stem(path))
         if not match:
             continue
         scene_num = int(match.group(1))
-        by_scene.setdefault(scene_num, str(path))
+        target = video_by_scene if is_video_file(str(path)) else image_by_scene
+        target.setdefault(scene_num, str(path))
+
+    by_scene = {**image_by_scene, **video_by_scene}  # video overrides image on conflict
 
     # CSV-supplied explicit image paths win over the numbered-filename lookup.
     if overrides:
@@ -260,9 +293,9 @@ def find_scene_images(
     missing = [i for i in range(1, num_scenes + 1) if i not in by_scene]
     if missing:
         raise FileNotFoundError(
-            f"Not enough scene images in {images_dir}\n"
+            f"Not enough scene images/clips in {images_dir}\n"
             f"Scenes Found: {num_scenes}\n"
-            f"Images Found: {len(by_scene)}\n"
+            f"Images/Clips Found: {len(by_scene)}\n"
             f"Missing scene number(s): {missing}"
         )
     return {i: by_scene[i] for i in range(1, num_scenes + 1)}
@@ -507,6 +540,10 @@ def render_scene_clip(
     fps: int = 30,
     ass_path: Optional[str] = None,
 ) -> None:
+    if is_video_file(image_path):
+        _render_video_scene_clip(image_path, duration, out_path, resolution, fps, ass_path=ass_path)
+        return
+
     out_w, out_h = resolution
     if effect:
         vf = _zoompan_filter(effect, duration, fps, out_w, out_h)
@@ -533,6 +570,46 @@ def render_scene_clip(
         "-vf", vf,
         "-r", str(fps),
         "-fps_mode", "cfr",
+        "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p",
+        out_path,
+    ]
+    run(cmd)
+
+
+def _render_video_scene_clip(
+    video_path: str,
+    duration: float,
+    out_path: str,
+    resolution: tuple[int, int],
+    fps: int,
+    ass_path: Optional[str] = None,
+) -> None:
+    """Scene source is itself a video clip (e.g. b-roll) rather than a still
+    image. Scaled/cropped to fill the frame the same way images are, then
+    looped (not frozen on the last frame) if shorter than the scene needs and
+    trimmed to the EXACT scene duration -- same guarantee as image scenes.
+    No Ken-Burns zoompan effect here since the clip already has real motion.
+    Captions (ass_path) are burned in the same filter chain, same as images.
+    The clip's own audio is dropped (-an): the final render always mixes in
+    the single continuous voiceover track on top, so any embedded audio here
+    would just be muted/discarded anyway."""
+    out_w, out_h = resolution
+    vf = (
+        f"scale={out_w}:{out_h}:force_original_aspect_ratio=increase,"
+        f"crop={out_w}:{out_h},format=yuv420p,fps={fps}"
+    )
+    if ass_path:
+        ass_escaped = ass_path.replace("\\", "/").replace(":", "\\:")
+        vf = f"{vf},subtitles='{ass_escaped}'"
+    cmd = [
+        _ffmpeg(), "-y",
+        "-stream_loop", "-1",  # loop source indefinitely; -t below cuts to exact length
+        "-i", video_path,
+        "-t", f"{duration:.3f}",
+        "-vf", vf,
+        "-r", str(fps),
+        "-fps_mode", "cfr",
+        "-an",
         "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p",
         out_path,
     ]
@@ -773,6 +850,8 @@ def build_video(
         same ordered list of scene texts feeding the rest of the pipeline.
     effects: pool of Ken-Burns effect names to apply randomly per scene.
         None -> use all of EFFECTS (default/back-compat). [] -> no effect at all.
+        Video-clip scenes never get an effect regardless of this pool, since
+        the clip already has real motion.
     effect_weights: optional {effect_name: weight} mix controlling how often each
         effect in `effects` is picked (e.g. {"zoom_in": 70, "pan_left": 30} makes
         zoom_in ~2.3x more likely than pan_left). Weights are relative, not
@@ -851,12 +930,17 @@ def build_video(
         tasks = []
         for i, (scene_text, (start, end)) in enumerate(zip(scenes, boundaries), start=1):
             duration = max(0.05, end - start)
-            if effect_weights:
+            scene_is_video = is_video_file(scene_images[i])
+            if scene_is_video:
+                effect = None
+            elif effect_weights:
                 effect = next_effect()
             else:
                 effect = effect_order[(i - 1) % len(effect_order)] if effect_order else None
             if duration < MIN_DURATION_FOR_EFFECT:
                 effect = None  # too short for a pan/zoom to read as intentional
+            effect_label = "none (video clip)" if scene_is_video else (effect or "none")
+            log(f"Scene {i}/{len(scenes)}: {duration:.2f}s, effect={effect_label}")
             scene_words = [w for w in words if start <= (w.start + w.end) / 2 < end] if captions else []
             tasks.append((
                 i, scene_images[i], duration, effect, scene_words,

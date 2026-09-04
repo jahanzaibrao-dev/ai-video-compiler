@@ -1,9 +1,10 @@
 # Scene-Synced Slideshow Video Builder
 
 Local, free, no-API tool that turns a script + a single continuous voiceover + a
-folder of scene-numbered images into a rendered MP4, with each image shown for
-the *exact* duration its scene is spoken, rotating Ken-Burns pan/zoom effects,
-and word-by-word karaoke captions burned in.
+folder of scene-numbered images and/or video clips into a rendered MP4, with each
+image or clip shown for the *exact* duration its scene is spoken, rotating
+Ken-Burns pan/zoom effects on image scenes, and word-by-word karaoke captions
+burned in.
 
 See `REPORT.md` for the full research writeup (existing tools compared, why this
 approach was chosen). This file covers setup and day-to-day use.
@@ -16,9 +17,10 @@ approach was chosen). This file covers setup and day-to-day use.
    word-by-word timestamp map — no internet/API calls after the model downloads once.
 3. It aligns your script's words to the transcript (same technique as a text diff)
    to find exactly when each scene starts/ends in the audio.
-4. It renders each `<scene_number>.png/jpg` for that exact duration with a
-   rotating pan/zoom effect, burns in synced karaoke captions, then stitches
-   everything together and drops your original voiceover on top.
+4. It renders each `<scene_number>.png/jpg/mp4/...` for that exact duration —
+   images get a rotating pan/zoom effect, video clips play as-is (looped/trimmed
+   to fit) — burns in synced karaoke captions, then stitches everything together
+   and drops your original voiceover on top.
 
 ## 1. First-time setup
 
@@ -49,6 +51,13 @@ and is cached locally after that.
     (sentence 1 → scene 1, etc.), matching your stated requirement.
 - `voiceover.mp3` (or .wav/.m4a) — the single continuous narration of the whole script.
 - `images/` folder — `1.png` (or .jpg), `2.png`, `3.jpg`, ... one per scene number.
+  A scene's source can also be a video clip instead of a still image — e.g.
+  `4.mp4` — named the same way (`<scene_number>.ext`); supported video
+  extensions are `.mp4`, `.mov`, `.mkv`, `.webm`, `.avi`, `.m4v`. Video scenes
+  are scaled/cropped to fill the frame and looped or trimmed to the scene's
+  exact duration, but don't get the Ken-Burns pan/zoom effect (they already
+  have real motion), and any audio embedded in the clip is dropped — only the
+  single continuous voiceover is heard.
 
 ## 3. Run it
 
@@ -58,10 +67,10 @@ and is cached locally after that.
 python app.py
 ```
 
-Opens a browser tab where you upload the script/audio and point to the images
-folder (or upload a zip of them), pick resolution/fps/caption toggle, and click
-Render. Good for 200-300 images since you just point to a folder path rather
-than uploading each file individually.
+Opens a browser tab where you upload the script/audio and point to the
+images/video-clips folder (or upload a zip of them), pick resolution/fps/caption
+toggle, and click Render. Good for 200-300 files since you just point to a
+folder path rather than uploading each file individually.
 
 **Command line:**
 

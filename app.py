@@ -5,9 +5,10 @@ Run with:
     python app.py
 
 Opens a browser tab at http://127.0.0.1:7860 where you can upload the script,
-the voiceover, and the scene images (either a folder path on this machine, or
-a .zip of images named 1.png, 2.jpg, ... one per scene), then render and
-download the finished video. Everything runs locally - no cloud calls.
+the voiceover, and the scene sources (either a folder path on this machine, or
+a .zip of files named 1.png, 2.jpg, 3.mp4, ... one per scene, images or video
+clips), then render and download the finished video. Everything runs locally
+- no cloud calls.
 """
 
 from __future__ import annotations
@@ -120,7 +121,7 @@ def _prepare_images_dir(images_zip, images_folder_path: str) -> str:
         if len(entries) == 1 and entries[0].is_dir():
             return str(entries[0])
         return str(extract_dir)
-    raise gr.Error("Provide either a folder path or a .zip of scene images.")
+    raise gr.Error("Provide either a folder path or a .zip of scene images/video clips.")
 
 
 def _safe_filename(title: str) -> str:
@@ -245,9 +246,10 @@ with gr.Blocks(title="Scene-Synced Slideshow Video Builder") as demo:
     gr.Markdown(
         "# Scene-Synced Slideshow Video Builder\n"
         "Upload your script, your single continuous voiceover, and your scene-numbered "
-        "images (`1.png`, `2.jpg`, ...). Each image will be shown for the exact duration "
-        "its scene is spoken, with rotating pan/zoom effects and word-by-word captions "
-        "burned in. Everything runs locally on this machine."
+        "images and/or video clips (`1.png`, `2.jpg`, `3.mp4`, ...). Each image or clip "
+        "will be shown for the exact duration its scene is spoken, with rotating pan/zoom "
+        "effects on image scenes and word-by-word captions burned in. Everything runs "
+        "locally on this machine."
     )
 
     with gr.Row():
@@ -257,12 +259,12 @@ with gr.Blocks(title="Scene-Synced Slideshow Video Builder") as demo:
                 file_types=[".txt", ".csv"],
             )
             audio_file = gr.File(label="Voiceover (.mp3/.wav/.m4a)")
-            gr.Markdown("**Scene images** — provide ONE of the two options below:")
+            gr.Markdown("**Scene images/video clips** — provide ONE of the two options below:")
             images_folder_path = gr.Textbox(
-                label="Images folder path (on this machine)",
-                placeholder="/path/to/images  (fastest for 200-300 images)",
+                label="Images/videos folder path (on this machine)",
+                placeholder="/path/to/images  (fastest for 200-300 files)",
             )
-            images_zip = gr.File(label="...or a .zip of scene images", file_types=[".zip"])
+            images_zip = gr.File(label="...or a .zip of scene images/video clips", file_types=[".zip"])
 
         with gr.Column():
             video_title = gr.Textbox(
@@ -292,7 +294,7 @@ with gr.Blocks(title="Scene-Synced Slideshow Video Builder") as demo:
                 # (e.g. rapid add/remove churn); our own _resolve_selection already ignores
                 # anything unrecognized, so let it through here rather than hard-erroring.
                 allow_custom_value=True,
-                info="Pan/zoom effects applied randomly per scene. Deselect all to show plain static images.",
+                info="Pan/zoom effects applied randomly per image scene (video-clip scenes always play as-is). Deselect all to show plain static images.",
             )
             effects_prev_state = gr.State([ALL_OPTION] + EFFECT_CHOICES[1:])
             
@@ -321,7 +323,7 @@ with gr.Blocks(title="Scene-Synced Slideshow Video Builder") as demo:
                 info=(
                     f"Smooth crossfade transitions applied randomly between scenes. Deselect all to "
                     f"disable and use hard cuts everywhere. Note: a transition only plays when the "
-                    f"next image stays on screen for more than {MIN_DURATION_FOR_TRANSITION:.0f} seconds "
+                    f"next scene stays on screen for more than {MIN_DURATION_FOR_TRANSITION:.0f} seconds "
                     f"— shorter scenes always get a hard cut."
                 ),
             )
